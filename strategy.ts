@@ -92,6 +92,10 @@ interface Coin {
   creatorSold: boolean;
   trades: number;
   buyers: Map<Pubkey, bigint>;
+  /** Largest single non-creator buyer's total bought SOL (maintained
+   * incrementally on every buy, so the entry scan never re-walks the
+   * buyers map). */
+  whale: bigint;
   boughtSol: bigint;
   soldSol: bigint;
   lastTradeSlot: number;
@@ -102,6 +106,9 @@ interface Coin {
   /** Index of the oldest live sample; earlier entries are dead weight. */
   sHead: number;
   entered: boolean;
+  /** Insertion order among candidates (0 = never a candidate); used to
+   * keep the dirty-scan order identical to the old full scan. */
+  candSeq: number;
 }
 
 interface Held {
@@ -133,6 +140,22 @@ export function createStrategy(params: Params = DEFAULT_PARAMS) {
    * full map is thousands of dead launches, and rescanning it on every
    * batch is what used to eat the run's wall clock. */
   const candidates = new Set<Pubkey>();
+  /** Candidates whose own state changed in the latest batch (a trade, a
+   * complete) and therefore need re-evaluating, keyed by insertion order
+   * so a dirty scan visits them in exactly the old full-scan order.
+   * Everything else about a candidate — its buyers, its peak, its curve
+   * — only changes when its own mint trades, so re-scanning the whole
+   * set on every one of the ~63k batches was the wall-clock sink that
+   * timed the bot out in the 1-core sandbox. A candidate can also become
+   * eligible without trading: by ageing into its tier, by the pace tier
+   * loosening, or by a fill freeing cash/positions. Those are caught by
+   * the age queue, the tier comparison and the fills check in onBatch. */
+  const dirty = new Map<Pubkey, number>();
+  /** Candidates waiting only on age: mint -> earliest slot to recheck. */
+  const ageWait = new Map<Pubkey, number>();
+  let nextAgeSlot = Number.POSITIVE_INFINITY;
+  let candCounter = 0;
+  let lastTier = -1;
   const held = new Map<Pubkey, Held>();
   let firstTime: number | null = null;
   let nowTime = 0;
@@ -151,6 +174,7 @@ export function createStrategy(params: Params = DEFAULT_PARAMS) {
             creatorSold: false,
             trades: 0,
             buyers: new Map(),
+            whale: 0n,
             boughtSol: 0n,
             soldSol: 0n,
             lastTradeSlot: e.slot,
@@ -159,6 +183,7 @@ export function createStrategy(params: Params = DEFAULT_PARAMS) {
             samples: [{ slot: e.slot, rq: 0n }],
             sHead: 0,
             entered: false,
+            candSeq: 0,
           });
         }
       } else if (e.event === 'TradeEvent') {
@@ -169,7 +194,11 @@ export function createStrategy(params: Params = DEFAULT_PARAMS) {
         c.lastTradeSlot = e.slot;
         if (e.is_buy) {
           c.boughtSol += sol;
-          if (e.user !== c.creator) c.buyers.set(e.user, (c.buyers.get(e.user) ?? 0n) + sol);
+          if (e.user !== c.creator) {
+            const tot = (c.buyers.get(e.user) ?? 0n) + sol;
+            c.buyers.set(e.user, tot);
+            if (tot > c.whale) c.whale = tot;
+          }
         } else {
           c.soldSol += sol;
           if (e.user === c.creator) c.creatorSold = true;
@@ -187,15 +216,25 @@ export function createStrategy(params: Params = DEFAULT_PARAMS) {
           c.samples.splice(0, c.sHead);
           c.sHead = 0;
         }
-        if (c.creatorSold) candidates.delete(e.mint);
-        else if (!c.entered && c.trades >= 25 && c.buyers.size >= P.minBuyers) candidates.add(e.mint);
+        if (c.creatorSold) {
+          candidates.delete(e.mint);
+          dirty.delete(e.mint);
+          ageWait.delete(e.mint);
+        } else if (!c.entered && c.trades >= 25 && c.buyers.size >= P.minBuyers) {
+          if (!candidates.has(e.mint)) {
+            candidates.add(e.mint);
+            c.candSeq = ++candCounter;
+          }
+          dirty.set(e.mint, c.candSeq);
+        } else if (candidates.has(e.mint)) {
+          dirty.set(e.mint, c.candSeq);
+        }
+      } else if (candidates.has(e.mint)) {
+        // e.g. CompleteEvent: the curve is now complete, so the entry
+        // scan must see this coin once more to drop it.
+        dirty.set(e.mint, coins.get(e.mint)!.candSeq);
       }
     }
-  }
-
-  function hasPending(state: BotState, mint: Pubkey): boolean {
-    for (const p of state.pending.values()) if (p.order.mint === mint) return true;
-    return false;
   }
 
   /** Which filter tier the pace currently allows: 0 strict, 1 medium, 2 loose.
@@ -216,6 +255,10 @@ export function createStrategy(params: Params = DEFAULT_PARAMS) {
     watch(batch);
     const orders: OrderInput[] = [];
     const slot = batch.slot;
+    /** Pending mints, built once per batch: the old hasPending() re-walked
+     * the whole pending map for every position and every candidate. */
+    const pendingMints = new Set<Pubkey>();
+    for (const p of state.pending.values()) pendingMints.add(p.order.mint);
 
     for (const mint of [...held.keys()]) {
       if (!state.positions.has(mint)) held.delete(mint);
@@ -228,7 +271,7 @@ export function createStrategy(params: Params = DEFAULT_PARAMS) {
         h = { sinceSlot: slot, peakValue: 0n };
         held.set(mint, h);
       }
-      if (hasPending(state, mint)) continue;
+      if (pendingMints.has(mint)) continue;
       const curve = state.curves.get(mint);
       if (curve === undefined || curve.complete) continue;
       const value = liquidationValue(pos.token_amount, curve.virtual_quote_reserves, curve.virtual_token_reserves);
@@ -249,48 +292,86 @@ export function createStrategy(params: Params = DEFAULT_PARAMS) {
       }
     }
 
-    // Entries, while position slots and cash allow. Only the candidate
-    // set is scanned: every coin in it has the trades and the crowd, and
-    // the tier's own thresholds are re-checked below exactly as before.
-    const tier = TIERS[tierNow()];
+    // Entries, while position slots and cash allow. The checks below are
+    // exactly the old ones, in the same order — only the set being scanned
+    // changed. A full scan runs when the pace tier changed, when a fill
+    // freed cash or a position slot, or when the earliest age-waiting
+    // candidate comes due; otherwise only candidates whose own mint
+    // traded in this batch are re-checked, in candidate insertion order.
+    const tierIdx = tierNow();
+    const tier = TIERS[tierIdx];
+    const fullScan =
+      tierIdx !== lastTier || batch.fills.length > 0 || slot >= nextAgeSlot;
+    lastTier = tierIdx;
     let committed = state.committedPositionCount();
-    for (const mint of candidates) {
+    let scan: Pubkey[];
+    if (fullScan) {
+      scan = [...candidates];
+    } else {
+      scan = [...dirty.entries()].sort((a, b) => a[1] - b[1]).map(([m]) => m);
+    }
+    for (let i = 0; i < scan.length; i++) {
+      const mint = scan[i]!;
       const c = coins.get(mint);
-      if (c === undefined) { candidates.delete(mint); continue; }
-      if (orders.length >= 16) break;
-      if (committed >= state.hello.caps.max_open_positions) break;
-      if (c.entered || c.creatorSold) { candidates.delete(mint); continue; }
-      if (slot - c.createdSlot < tier.minAgeSlots) continue;
-      if (c.trades < tier.minTrades || c.buyers.size < P.minBuyers) continue;
+      if (c === undefined) { candidates.delete(mint); dirty.delete(mint); ageWait.delete(mint); continue; }
+      if (orders.length >= 16 || committed >= state.hello.caps.max_open_positions) {
+        // A later candidate could still pass next batch (fresh order cap,
+        // or a fill freeing a slot), so keep the unvisited ones dirty.
+        for (let j = i; j < scan.length; j++) dirty.set(scan[j]!, coins.get(scan[j]!)?.candSeq ?? 0);
+        break;
+      }
+      if (c.entered || c.creatorSold) { candidates.delete(mint); dirty.delete(mint); ageWait.delete(mint); continue; }
+      if (slot - c.createdSlot < tier.minAgeSlots) {
+        // Only age blocks this coin: recheck when it comes of age (or on
+        // the next full scan, e.g. a tier loosening that lowers minAge).
+        const dueSlot = c.createdSlot + tier.minAgeSlots;
+        ageWait.set(mint, dueSlot);
+        if (dueSlot < nextAgeSlot) nextAgeSlot = dueSlot;
+        dirty.delete(mint);
+        continue;
+      }
+      ageWait.delete(mint);
+      if (c.trades < tier.minTrades || c.buyers.size < P.minBuyers) { dirty.delete(mint); continue; }
       const traded = c.boughtSol + c.soldSol;
-      if (traded === 0n || (c.boughtSol * BPS) / traded < BigInt(P.minBuyShareBps)) continue;
-      let whale = 0n;
-      for (const v of c.buyers.values()) if (v > whale) whale = v;
-      if (c.boughtSol > 0n && (whale * BPS) / c.boughtSol > BigInt(P.maxWhaleShareBps)) continue;
+      if (traded === 0n || (c.boughtSol * BPS) / traded < BigInt(P.minBuyShareBps)) { dirty.delete(mint); continue; }
+      if (c.boughtSol > 0n && (c.whale * BPS) / c.boughtSol > BigInt(P.maxWhaleShareBps)) { dirty.delete(mint); continue; }
       const curve = state.curves.get(mint);
-      if (curve === undefined) continue;
-      if (curve.complete) { candidates.delete(mint); continue; }
-      if (curve.real_quote_reserves < tier.minRealSol || curve.real_quote_reserves > tier.maxRealSol) continue;
+      if (curve === undefined) { dirty.delete(mint); continue; }
+      if (curve.complete) { candidates.delete(mint); dirty.delete(mint); ageWait.delete(mint); continue; }
+      if (curve.real_quote_reserves < tier.minRealSol || curve.real_quote_reserves > tier.maxRealSol) { dirty.delete(mint); continue; }
       const base = c.samples[c.sHead];
-      if (base === undefined || base.rq === 0n) continue;
-      if (slot - base.slot > P.growthWindow + 30) continue;
-      if ((curve.real_quote_reserves * BPS) / base.rq < BigInt(10_000 + tier.minGrowthBps)) continue;
+      if (base === undefined || base.rq === 0n) { dirty.delete(mint); continue; }
+      if (slot - base.slot > P.growthWindow + 30) { dirty.delete(mint); continue; }
+      if ((curve.real_quote_reserves * BPS) / base.rq < BigInt(10_000 + tier.minGrowthBps)) { dirty.delete(mint); continue; }
       // Not pinned to the top: skip when the current price is above
       // maxPeakShareBps of the peak price (vq/vt vs peakVq/peakVt).
       if (
         curve.virtual_quote_reserves * c.peakVt * BPS >
         curve.virtual_token_reserves * c.peakVq * BigInt(P.maxPeakShareBps)
-      ) continue;
-      if (state.positions.has(mint) || hasPending(state, mint)) continue;
+      ) { dirty.delete(mint); continue; }
+      if (state.positions.has(mint) || pendingMints.has(mint)) continue;
       const cap = state.maxBuyLamports(mint);
       const amount = P.stakeLamports < cap ? P.stakeLamports : cap;
-      if (amount < 10_000_000n) continue;
-      if (state.freeCashLamports() - amount < 0n) break;
+      if (amount < 10_000_000n) { dirty.delete(mint); continue; }
+      if (state.freeCashLamports() - amount < 0n) {
+        for (let j = i; j < scan.length; j++) dirty.set(scan[j]!, coins.get(scan[j]!)?.candSeq ?? 0);
+        break;
+      }
       orders.push({ side: 'buy', mint, quote_lamports: amount, max_slippage_bps: P.buySlippageBps });
       c.entered = true;
       candidates.delete(mint);
+      dirty.delete(mint);
+      ageWait.delete(mint);
       entries += 1;
       committed += 1;
+    }
+    // Recompute the age horizon only after a full scan (dirty scans do
+    // not change it except through the age check above, which maintains
+    // it incrementally; a stale-low value only triggers an extra full
+    // scan, never a missed promotion).
+    if (fullScan) {
+      nextAgeSlot = Number.POSITIVE_INFINITY;
+      for (const s of ageWait.values()) if (s < nextAgeSlot) nextAgeSlot = s;
     }
     return orders;
   }
