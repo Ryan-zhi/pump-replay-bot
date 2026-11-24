@@ -99,6 +99,8 @@ interface Coin {
   peakVq: bigint;
   peakVt: bigint;
   samples: ReserveSample[];
+  /** Index of the oldest live sample; earlier entries are dead weight. */
+  sHead: number;
   entered: boolean;
 }
 
@@ -125,6 +127,12 @@ export function createStrategy(params: Params = DEFAULT_PARAMS) {
   // Lamport knobs may arrive as plain numbers from a JSON sweep: normalise.
   const P: Params = { ...params, stakeLamports: BigInt(params.stakeLamports) };
   const coins = new Map<Pubkey, Coin>();
+  /** Coins that have cleared the tape-evidence bar (trade count and buyer
+   * count only grow, so membership is monotonic). The entry scan walks
+   * this small set instead of every coin ever seen — on a long tape the
+   * full map is thousands of dead launches, and rescanning it on every
+   * batch is what used to eat the run's wall clock. */
+  const candidates = new Set<Pubkey>();
   const held = new Map<Pubkey, Held>();
   let firstTime: number | null = null;
   let nowTime = 0;
@@ -149,6 +157,7 @@ export function createStrategy(params: Params = DEFAULT_PARAMS) {
             peakVq: BigInt(e.virtual_quote_reserves),
             peakVt: BigInt(e.virtual_token_reserves),
             samples: [{ slot: e.slot, rq: 0n }],
+            sHead: 0,
             entered: false,
           });
         }
@@ -173,7 +182,13 @@ export function createStrategy(params: Params = DEFAULT_PARAMS) {
         }
         c.samples.push({ slot: e.slot, rq: BigInt(e.real_quote_reserves) });
         const floor = e.slot - P.growthWindow;
-        while (c.samples.length > 1 && c.samples[1].slot <= floor) c.samples.shift();
+        while (c.samples.length - c.sHead > 1 && c.samples[c.sHead + 1].slot <= floor) c.sHead += 1;
+        if (c.sHead > 512) {
+          c.samples.splice(0, c.sHead);
+          c.sHead = 0;
+        }
+        if (c.creatorSold) candidates.delete(e.mint);
+        else if (!c.entered && c.trades >= 25 && c.buyers.size >= P.minBuyers) candidates.add(e.mint);
       }
     }
   }
@@ -234,13 +249,17 @@ export function createStrategy(params: Params = DEFAULT_PARAMS) {
       }
     }
 
-    // Entries, while position slots and cash allow.
+    // Entries, while position slots and cash allow. Only the candidate
+    // set is scanned: every coin in it has the trades and the crowd, and
+    // the tier's own thresholds are re-checked below exactly as before.
     const tier = TIERS[tierNow()];
     let committed = state.committedPositionCount();
-    for (const [mint, c] of coins) {
+    for (const mint of candidates) {
+      const c = coins.get(mint);
+      if (c === undefined) { candidates.delete(mint); continue; }
       if (orders.length >= 16) break;
       if (committed >= state.hello.caps.max_open_positions) break;
-      if (c.entered || c.creatorSold) continue;
+      if (c.entered || c.creatorSold) { candidates.delete(mint); continue; }
       if (slot - c.createdSlot < tier.minAgeSlots) continue;
       if (c.trades < tier.minTrades || c.buyers.size < P.minBuyers) continue;
       const traded = c.boughtSol + c.soldSol;
@@ -249,9 +268,10 @@ export function createStrategy(params: Params = DEFAULT_PARAMS) {
       for (const v of c.buyers.values()) if (v > whale) whale = v;
       if (c.boughtSol > 0n && (whale * BPS) / c.boughtSol > BigInt(P.maxWhaleShareBps)) continue;
       const curve = state.curves.get(mint);
-      if (curve === undefined || curve.complete) continue;
+      if (curve === undefined) continue;
+      if (curve.complete) { candidates.delete(mint); continue; }
       if (curve.real_quote_reserves < tier.minRealSol || curve.real_quote_reserves > tier.maxRealSol) continue;
-      const base = c.samples[0];
+      const base = c.samples[c.sHead];
       if (base === undefined || base.rq === 0n) continue;
       if (slot - base.slot > P.growthWindow + 30) continue;
       if ((curve.real_quote_reserves * BPS) / base.rq < BigInt(10_000 + tier.minGrowthBps)) continue;
@@ -268,6 +288,7 @@ export function createStrategy(params: Params = DEFAULT_PARAMS) {
       if (state.freeCashLamports() - amount < 0n) break;
       orders.push({ side: 'buy', mint, quote_lamports: amount, max_slippage_bps: P.buySlippageBps });
       c.entered = true;
+      candidates.delete(mint);
       entries += 1;
       committed += 1;
     }
